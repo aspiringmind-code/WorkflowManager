@@ -1,0 +1,122 @@
+name: reqmgr2cwl
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "workflows/**.json"
+      - "reqmgr2cwl/**"
+      - "ci/**"
+      - "scripts/**"
+      - ".github/workflows/reqmgr2cwl.yml"
+  pull_request:
+    paths:
+      - "workflows/**.json"
+      - "reqmgr2cwl/**"
+      - "ci/**"
+      - "scripts/**"
+  workflow_dispatch:
+    inputs:
+      reqmgr2_json:
+        description: "Path to the ReqMgr2 request JSON to translate"
+        required: false
+        default: "workflows/example_request.json"
+      run_execution:
+        description: "Also execute the translated CWL workflow with cwltool?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+env:
+  REQMGR2_JSON: ${{ github.event.inputs.reqmgr2_json || 'workflows/example_request.json' }}
+  CWL_OUTPUT_DIR: cwl_output
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 1. Validate: fail fast if the JSON isn't a well-formed TaskChain/StepChain
+  # ---------------------------------------------------------------------
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python ci/validate_reqmgr2.py "$REQMGR2_JSON"
+
+  # ---------------------------------------------------------------------
+  # 2. Translate: ReqMgr2 JSON -> CWL Workflow + CommandLineTools + job.yml
+  # ---------------------------------------------------------------------
+  translate:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pyyaml
+      - run: python reqmgr2cwl/translator.py "$REQMGR2_JSON" "$CWL_OUTPUT_DIR"
+      - run: cp scripts/cmsRun_wrapper.sh "$CWL_OUTPUT_DIR/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cwl-output
+          path: ${{ env.CWL_OUTPUT_DIR }}/
+          retention-days: 7
+
+  # ---------------------------------------------------------------------
+  # 3. Lint: validate CWL syntax/schema with cwltool (no execution)
+  # ---------------------------------------------------------------------
+  lint:
+    needs: translate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet cwltool
+      - uses: actions/download-artifact@v4
+        with:
+          name: cwl-output
+          path: ${{ env.CWL_OUTPUT_DIR }}
+      - run: cwltool --validate "$CWL_OUTPUT_DIR/workflow.cwl"
+
+  # ---------------------------------------------------------------------
+  # 4. Run: execute the workflow. Gated behind workflow_dispatch so it
+  #    never fires on an ordinary push/PR (see README for the manual-
+  #    execution caveats: this runs the stub cmsRun_wrapper.sh unless you
+  #    point it at real psets + a CMSSW/CVMFS-capable runner).
+  #
+  #    For an approval-style gate instead of an input flag, add
+  #    `environment: cwl-run` here and configure required reviewers on
+  #    that environment under Settings -> Environments.
+  # ---------------------------------------------------------------------
+  run_cwl:
+    needs: [translate, lint]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_execution == 'true'
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet cwltool
+      - uses: actions/download-artifact@v4
+        with:
+          name: cwl-output
+          path: ${{ env.CWL_OUTPUT_DIR }}
+      - name: stage placeholder configs and run
+        run: |
+          chmod +x "$CWL_OUTPUT_DIR/cmsRun_wrapper.sh"
+          export PATH="$GITHUB_WORKSPACE/$CWL_OUTPUT_DIR:$PATH"
+          mkdir -p "$CWL_OUTPUT_DIR/configs"
+          for f in $(grep -oE '[A-Za-z0-9_]+_config\.py' "$CWL_OUTPUT_DIR/job.yml" || true); do
+            echo "# placeholder pset" > "$CWL_OUTPUT_DIR/configs/$(basename "$f")"
+          done
+          cd "$CWL_OUTPUT_DIR"
+          cwltool --no-container --outdir ../results workflow.cwl job.yml
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: cwl-results
+          path: results/
